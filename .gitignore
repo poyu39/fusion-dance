@@ -15,3 +15,6 @@ outputs/
 fusions/
 *.npy
 *.pkl
+
+.venv/
+outputs/

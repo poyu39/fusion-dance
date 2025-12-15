@@ -5,17 +5,17 @@ import os
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pytorch_msssim
 import torch
 import torch.nn as nn
-import pytorch_msssim
-from tqdm import tqdm
-
 import utils.data as data
 import utils.graphics as graphics
 import utils.loss as loss
+from logger import setup_logger
 from models import vqvae
+from tqdm import tqdm
 
-seed = 42
+seed = 39
 np.random.seed(seed)
 _ = torch.manual_seed(seed)
 
@@ -25,11 +25,16 @@ _ = torch.manual_seed(seed)
 
 experiment_name = f"vq_vae_v5.10"
 
+output_prefix = f"outputs/{experiment_name}"
+os.makedirs(output_prefix, exist_ok=True)
+
+logger = setup_logger(name="VQ_VAE_Logger", project_root=os.getcwd(), log_file=os.path.join(output_prefix, "vq_vae.log"))
+
 # Hyperparameters
 learning_rate = 1e-4
 epochs = 25
 batch_size = 64
-num_dataloader_workers = 0
+num_dataloader_workers = 12
 
 # VQ-VAE Config
 num_layers = 0
@@ -51,12 +56,11 @@ image_size = 64
 use_noise_images = True
 load_data_to_memory = True
 
-data_prefix = "data\\Pokemon\\final\\standard"
+data_prefix = './data/Pokemon/original_data_preprocessed'
+# data_prefix = "data\\Pokemon\\final\\standard"
 train_data_folder = os.path.join(data_prefix, "train")
 val_data_folder = os.path.join(data_prefix, "val")
 test_data_folder = os.path.join(data_prefix, "test")
-
-output_prefix = f"data\\{experiment_name}"
 
 output_dir = os.path.join(output_prefix, "generated")
 loss_output_path = output_prefix
@@ -74,7 +78,7 @@ test_sample_output_name = os.path.join(output_prefix, "test_sample_output.jpg")
 # Setup Device
 gpu = torch.cuda.is_available()
 device = torch.device("cuda" if gpu else "cpu")
-print(gpu, device)
+logger.info(f"GPU Available: {gpu}, Device: {device}")
 
 # Create Output Paths
 if not os.path.exists(output_dir):
@@ -142,7 +146,7 @@ model = vqvae.VQVAE(
     use_max_filters=use_max_filters,
     max_filters=max_filters,
 )
-print(model)
+logger.info(f"Model Architecture:\n{model}")
 model.to(device)
 
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -156,6 +160,49 @@ if use_ssim_loss:
 ################################################################################
 ################################### Training ###################################
 ################################################################################
+
+# Log training configuration
+logger.info("="*80)
+logger.info("Training Configuration:")
+logger.info("="*80)
+logger.info(f"Experiment Name: {experiment_name}")
+logger.info(f"Learning Rate: {learning_rate}")
+logger.info(f"Epochs: {epochs}")
+logger.info(f"Batch Size: {batch_size}")
+logger.info(f"Num Dataloader Workers: {num_dataloader_workers}")
+logger.info(f"Image Size: {image_size}")
+logger.info(f"Use Noise Images: {use_noise_images}")
+logger.info(f"Load Data to Memory: {load_data_to_memory}")
+logger.info("-"*80)
+logger.info(f"VQ-VAE Configuration:")
+logger.info(f"  Num Layers: {num_layers}")
+logger.info(f"  Num Embeddings: {num_embeddings}")
+logger.info(f"  Embedding Dim: {embedding_dim}")
+logger.info(f"  Commitment Cost: {commitment_cost}")
+logger.info(f"  Use Max Filters: {use_max_filters}")
+logger.info(f"  Max Filters: {max_filters}")
+logger.info(f"  Small Conv: {small_conv}")
+logger.info("-"*80)
+logger.info(f"Loss Configuration:")
+logger.info(f"  Use Sum: {use_sum}")
+logger.info(f"  Use SSIM Loss: {use_ssim_loss}")
+logger.info(f"  MSE Weight: {mse_weight}")
+logger.info(f"  SSIM Weight: {ssim_weight}")
+logger.info("-"*80)
+logger.info(f"Data Configuration:")
+logger.info(f"  Train Data: {train_data_folder}")
+logger.info(f"  Val Data: {val_data_folder}")
+logger.info(f"  Test Data: {test_data_folder}")
+logger.info(f"  Train Dataset Size: {len(train_data)}")
+logger.info(f"  Val Dataset Size: {len(val_data)}")
+logger.info(f"  Test Dataset Size: {len(test_data)}")
+logger.info("-"*80)
+logger.info(f"Output Configuration:")
+logger.info(f"  Output Directory: {output_dir}")
+logger.info(f"  Model Output Path: {model_output_path}")
+logger.info("="*80)
+logger.info("Starting Training...")
+logger.info("="*80)
 
 # Train
 all_samples = []
@@ -274,7 +321,7 @@ for epoch in range(epochs):
     val_perplexity.append(val_epoch_perplexity)
 
     # Print Metrics
-    print(
+    logger.info(
         f"\nEpoch: {epoch+1}/{epochs}:\
         \nTrain Loss = {train_loss}\
         \nTrain Reconstruction Loss = {train_recon_loss}\
@@ -349,7 +396,7 @@ with torch.no_grad():
 # Print Metrics
 mse = np.asarray(all_mse).mean()
 ssim_score = np.asarray(all_ssim).mean()
-print(f"\nMSE = {mse}, SSIM = {ssim_score}")
+logger.info(f"\nTest Metrics - MSE = {mse}, SSIM = {ssim_score}")
 
 # Pick a couple of sample images for an Input v Output comparison
 test_sample = data.get_samples_from_data(test_data, 16)
