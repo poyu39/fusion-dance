@@ -1,6 +1,43 @@
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
+
+
+def rgb_to_hsv_torch(img, eps=1e-6):
+    """
+    自行實作 RGB→HSV，避免依賴 torchvision 版本；確保梯度可傳遞。
+    """
+    if img.shape[1] != 3:
+        raise ValueError("RGB Tensor must have 3 channels.")
+    r, g, b = img[:, 0], img[:, 1], img[:, 2]
+    maxc, _ = img.max(dim=1)
+    minc, _ = img.min(dim=1)
+    deltac = maxc - minc
+
+    hue = torch.zeros_like(maxc)
+    sat = torch.zeros_like(maxc)
+    val = maxc
+
+    mask = deltac > eps
+    safe_denom = torch.where(mask, deltac, torch.ones_like(deltac))
+
+    # Hue 根據最大通道決定偏移
+    hue_r = torch.remainder((g - b) / safe_denom, 6)
+    hue_g = ((b - r) / safe_denom) + 2
+    hue_b = ((r - g) / safe_denom) + 4
+
+    hue = torch.where(mask & (maxc == r), hue_r, hue)
+    hue = torch.where(mask & (maxc == g), hue_g, hue)
+    hue = torch.where(mask & (maxc == b), hue_b, hue)
+    hue = torch.remainder(hue / 6.0, 1.0)
+
+    sat = torch.where(
+        maxc <= eps,
+        torch.zeros_like(maxc),
+        deltac / (maxc + eps),
+    )
+
+    return torch.stack([hue, sat, val], dim=1)
 
 
 def bits_per_dimension_loss(x_pred, x):
@@ -73,8 +110,83 @@ def mse_ssim_loss(
         # So we do 1 - ssim in order to minimize it.
         ssim = ssim_weight * (1 - ssim_module(reconstructed_x, x))
     else:
-        ssim = torch.tensor(0)
+        ssim = torch.tensor(0.0, device=reconstructed_x.device)
     return mse + ssim, {"MSE": mse.item(), "SSIM": ssim.item()}
+
+
+def palette_aware_loss(
+    reconstructed_x,
+    x,
+    use_sum=False,
+    hue_weight=1.0,
+    saturation_weight=0.5,
+    value_weight=0.25,
+):
+    """
+    將 RGB 映射到 HSV 後比較色相、飽和度與明度，避免純粹用 L2 無法感知色票差異。
+    hue_weight / saturation_weight / value_weight 用來控制三個通道的重要性。
+    """
+    reconstructed = torch.clamp(reconstructed_x, 0.0, 1.0)
+    target = torch.clamp(x, 0.0, 1.0)
+    reconstructed_hsv = rgb_to_hsv_torch(reconstructed)
+    target_hsv = rgb_to_hsv_torch(target)
+    hue_diff = torch.remainder(
+        reconstructed_hsv[:, 0:1] - target_hsv[:, 0:1] + 0.5, 1.0
+    ) - 0.5  # 讓色相差落在 [-0.5, 0.5]
+    sat_diff = reconstructed_hsv[:, 1:2] - target_hsv[:, 1:2]
+    val_diff = reconstructed_hsv[:, 2:3] - target_hsv[:, 2:3]
+    color_distance = (
+        hue_weight * torch.abs(hue_diff)
+        + saturation_weight * torch.abs(sat_diff)
+        + value_weight * torch.abs(val_diff)
+    )
+    if use_sum:
+        return color_distance.sum()
+    return color_distance.mean()
+
+
+def pixel_aware_reconstruction_loss(
+    reconstructed_x,
+    x,
+    use_sum=False,
+    ssim_module=None,
+    mse_weight=1.0,
+    ssim_weight=1.0,
+    palette_weight=1.0,
+    palette_kwargs=None,
+):
+    """
+    Pixel-aware loss = α·MSE + β·(1-SSIM) + γ·Palette loss。
+    palette_kwargs 允許針對色票距離設定不同權重，方便後續做消融。
+    """
+    loss_total = torch.tensor(0.0, device=reconstructed_x.device)
+    palette_kwargs = palette_kwargs or {}
+
+    mse = mse_weight * mse_loss(reconstructed_x, x, use_sum)
+    loss_total = loss_total + mse
+
+    if ssim_module and ssim_weight != 0:
+        ssim = ssim_weight * (1 - ssim_module(reconstructed_x, x))
+    else:
+        ssim = torch.tensor(0.0, device=reconstructed_x.device)
+    loss_total = loss_total + ssim
+
+    if palette_weight != 0:
+        palette = palette_weight * palette_aware_loss(
+            reconstructed_x,
+            x,
+            use_sum=use_sum,
+            **palette_kwargs,
+        )
+    else:
+        palette = torch.tensor(0.0, device=reconstructed_x.device)
+    loss_total = loss_total + palette
+
+    return loss_total, {
+        "MSE": mse.item(),
+        "SSIM": ssim.item(),
+        "Palette": palette.item(),
+    }
 
 
 def VAE_loss(

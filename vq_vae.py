@@ -23,7 +23,8 @@ _ = torch.manual_seed(seed)
 #################################### Config ####################################
 ################################################################################
 
-experiment_name = f"vq_vae_v5.10"
+# experiment_name = f"vq_vae_v5.10"
+experiment_name = f"vq_vae_pixel_aware_loss"
 
 output_prefix = f"outputs/{experiment_name}"
 os.makedirs(output_prefix, exist_ok=True)
@@ -47,9 +48,16 @@ small_conv = True  # Adapter Layer
 
 # Loss Config
 use_sum = False  # Use a sum instead of a mean for our loss function
-use_ssim_loss = False
+use_ssim_loss = True  # Pixel-aware Loss 預設會搭配 SSIM（可切換）
+use_pixel_aware_loss = True  # True 時會使用 Pixel-aware 重建 loss
 mse_weight = 1
-ssim_weight = 1
+ssim_weight = 0.15
+palette_loss_weight = 0.5
+palette_loss_kwargs = {
+    "hue_weight": 1.0,  # 色相權重：強化顏色 index 差異
+    "saturation_weight": 0.5,  # 飽和度權重：控制填色純度
+    "value_weight": 0.25,  # 明度權重：保留亮暗資訊
+}
 
 # Data Config
 image_size = 64
@@ -157,6 +165,29 @@ if use_ssim_loss:
         data_range=1.0, win_size=11, win_sigma=1.5, K=(0.01, 0.03)
     )
 
+
+def reconstruction_loss_fn(reconstructed, target):
+    """依設定切換 Pixel-aware loss 或原始 MSE+SSIM，方便進行消融。"""
+    if use_pixel_aware_loss:
+        return loss.pixel_aware_reconstruction_loss(
+            reconstructed,
+            target,
+            use_sum=use_sum,
+            ssim_module=ssim_module if use_ssim_loss else None,
+            mse_weight=mse_weight,
+            ssim_weight=ssim_weight,
+            palette_weight=palette_loss_weight,
+            palette_kwargs=palette_loss_kwargs,
+        )
+    return loss.mse_ssim_loss(
+        reconstructed,
+        target,
+        use_sum=use_sum,
+        ssim_module=ssim_module if use_ssim_loss else None,
+        mse_weight=mse_weight,
+        ssim_weight=ssim_weight,
+    )
+
 ################################################################################
 ################################### Training ###################################
 ################################################################################
@@ -186,8 +217,16 @@ logger.info("-"*80)
 logger.info(f"Loss Configuration:")
 logger.info(f"  Use Sum: {use_sum}")
 logger.info(f"  Use SSIM Loss: {use_ssim_loss}")
+logger.info(f"  Use Pixel-aware Loss: {use_pixel_aware_loss}")
 logger.info(f"  MSE Weight: {mse_weight}")
 logger.info(f"  SSIM Weight: {ssim_weight}")
+logger.info(f"  Palette Weight: {palette_loss_weight}")
+logger.info(
+    "  Palette HSV Weights: "
+    f"H={palette_loss_kwargs['hue_weight']}, "
+    f"S={palette_loss_kwargs['saturation_weight']}, "
+    f"V={palette_loss_kwargs['value_weight']}"
+)
 logger.info("-"*80)
 logger.info(f"Data Configuration:")
 logger.info(f"  Train Data: {train_data_folder}")
@@ -219,7 +258,7 @@ with torch.no_grad():
 # Add sample reconstruction to our list
 all_samples.append(epoch_sample.detach().cpu())
 
-for epoch in range(epochs):
+for epoch in tqdm(range(epochs), desc="Epochs"):
     train_loss = 0
     train_recon_loss = 0
     train_vq_loss = 0
@@ -231,7 +270,7 @@ for epoch in range(epochs):
 
     # Training Loop
     model.train()
-    for iteration, batch in enumerate(tqdm(train_dataloader)):
+    for iteration, batch in enumerate(tqdm(train_dataloader, desc=f"Training")):
         # Reset gradients back to zero for this iteration
         optimizer.zero_grad()
 
@@ -242,15 +281,8 @@ for epoch in range(epochs):
         # Run our model & get outputs
         vq_loss, reconstructed, perplexity, _ = model(batch)
 
-        # Calculate reconstruction loss
-        batch_loss, loss_dict = loss.mse_ssim_loss(
-            reconstructed,
-            batch,
-            use_sum=use_sum,
-            ssim_module=ssim_module,
-            mse_weight=mse_weight,
-            ssim_weight=ssim_weight,
-        )
+        # Calculate reconstruction loss（Pixel-aware 可視設定切換）
+        batch_loss, loss_dict = reconstruction_loss_fn(reconstructed, batch)
 
         # Add VQ-Loss to Overall Loss
         batch_loss += vq_loss
@@ -264,14 +296,15 @@ for epoch in range(epochs):
 
         # Add the batch's loss to the total loss for the epoch
         train_loss += batch_loss.item()
-        train_recon_loss += loss_dict["MSE"] + loss_dict["SSIM"]
+        recon_component = loss_dict["MSE"] + loss_dict["SSIM"] + loss_dict.get("Palette", 0)
+        train_recon_loss += recon_component
         train_vq_loss += loss_dict["Commitment Loss"]
         train_epoch_perplexity.append(perplexity.item())
 
     # Validation Loop
     model.eval()
     with torch.no_grad():
-        for iteration, batch in enumerate(tqdm(val_dataloader)):
+        for iteration, batch in enumerate(tqdm(val_dataloader, desc=f"Validation")):
             # Move batch to device
             _, batch = batch  # Returns key, value for each Pokemon
             batch = batch.to(device)
@@ -279,15 +312,8 @@ for epoch in range(epochs):
             # Run our model & get outputs
             vq_loss, reconstructed, perplexity, _ = model(batch)
 
-            # Calculate reconstruction loss
-            batch_loss, loss_dict = loss.mse_ssim_loss(
-                reconstructed,
-                batch,
-                use_sum=use_sum,
-                ssim_module=ssim_module,
-                mse_weight=mse_weight,
-                ssim_weight=ssim_weight,
-            )
+            # Calculate reconstruction loss（驗證同樣沿用 Pixel-aware 切換邏輯）
+            batch_loss, loss_dict = reconstruction_loss_fn(reconstructed, batch)
 
             # Add VQ-Loss to Overall Loss
             batch_loss += vq_loss
@@ -295,7 +321,8 @@ for epoch in range(epochs):
 
             # Add the batch's loss to the total loss for the epoch
             val_loss += batch_loss.item()
-            val_recon_loss += loss_dict["MSE"] + loss_dict["SSIM"]
+            recon_component = loss_dict["MSE"] + loss_dict["SSIM"] + loss_dict.get("Palette", 0)
+            val_recon_loss += recon_component
             val_vq_loss += loss_dict["Commitment Loss"]
             val_epoch_perplexity.append(perplexity.item())
 
