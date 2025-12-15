@@ -1,0 +1,31 @@
+[project]
+name = "fusion-dance"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "==3.12.11"
+dependencies = [
+    "torch==2.8.0",
+    "torchvision",
+    "torchaudio",
+    "transformers",
+    "opencv-python",
+    "pandas",
+    "matplotlib",
+    "plotly",
+    "jupyter",
+    "pytorch-fid",
+    "pytorch-msssim",
+    "scikit-learn",
+    "Pillow",
+    "tqdm",
+    "isort",
+    "nvitop"
+]
+
+[tool.uv]
+extra-index-url = ["https://pypi.org/simple", "https://download.pytorch.org/whl/cu128"]
+
+[tool.isort]
+profile = "hug"
+src_paths = ["isort", "test"]
