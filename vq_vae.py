@@ -23,8 +23,9 @@ _ = torch.manual_seed(seed)
 #################################### Config ####################################
 ################################################################################
 
-# experiment_name = f"vq_vae_v5.10"
-experiment_name = f"vq_vae_pixel_aware_loss"
+# experiment_name = f"vq_vae_v5.10_emb8"
+# experiment_name = f"vq_vae_pixel_aware_loss"
+experiment_name = f"vq_vae_multi_scale_codebook84_emb8"
 
 output_prefix = f"outputs/{experiment_name}"
 os.makedirs(output_prefix, exist_ok=True)
@@ -40,16 +41,21 @@ num_dataloader_workers = 12
 # VQ-VAE Config
 num_layers = 0
 num_embeddings = 256
-embedding_dim = 32
+# embedding_dim = 32
+embedding_dim = 8
 commitment_cost = 0.25
 use_max_filters = True # PixelSight Layer
 max_filters = 512
 small_conv = True  # Adapter Layer
+use_multi_scale_codebook = True  # True 啟用多尺度 codebook（結構 vs 細節）
+structure_downsample_factor = 8  # z_struct 使用 M=4 的降採樣感受野
+structure_embedding_dim = embedding_dim  # 可視需要放大/縮小結構 token 維度
+structure_num_embeddings = max(1, num_embeddings // 4)  # 結構 codebook 規模，預設減半以鼓勵語意分工
 
 # Loss Config
 use_sum = False  # Use a sum instead of a mean for our loss function
 use_ssim_loss = True  # Pixel-aware Loss 預設會搭配 SSIM（可切換）
-use_pixel_aware_loss = True  # True 時會使用 Pixel-aware 重建 loss
+use_pixel_aware_loss = False  # True 時會使用 Pixel-aware 重建 loss
 mse_weight = 1
 ssim_weight = 0.15
 palette_loss_weight = 0.5
@@ -144,16 +150,33 @@ sample = data.get_samples_from_data(val_data, 16)
 ################################################################################
 
 # Create Model
-model = vqvae.VQVAE(
-    num_layers=num_layers,
-    input_image_dimensions=image_size,
-    small_conv=small_conv,
-    embedding_dim=embedding_dim,
-    num_embeddings=num_embeddings,
-    commitment_cost=commitment_cost,
-    use_max_filters=use_max_filters,
-    max_filters=max_filters,
-)
+if use_multi_scale_codebook:
+    # 2-A Multi-Scale 版本：結構 codebook 先把形狀建起來，再補細節顏色
+    model = vqvae.MultiScaleVQVAE(
+        num_layers=num_layers,
+        input_image_dimensions=image_size,
+        small_conv=small_conv,
+        embedding_dim=embedding_dim,
+        num_embeddings=num_embeddings,
+        commitment_cost=commitment_cost,
+        use_max_filters=use_max_filters,
+        max_filters=max_filters,
+        structure_embedding_dim=structure_embedding_dim,
+        structure_num_embeddings=structure_num_embeddings,
+        structure_downsample_factor=structure_downsample_factor,
+    )
+else:
+    # 舊實驗：單一 codebook，方便做消融對比
+    model = vqvae.VQVAE(
+        num_layers=num_layers,
+        input_image_dimensions=image_size,
+        small_conv=small_conv,
+        embedding_dim=embedding_dim,
+        num_embeddings=num_embeddings,
+        commitment_cost=commitment_cost,
+        use_max_filters=use_max_filters,
+        max_filters=max_filters,
+    )
 logger.info(f"Model Architecture:\n{model}")
 model.to(device)
 
@@ -188,6 +211,21 @@ def reconstruction_loss_fn(reconstructed, target):
         ssim_weight=ssim_weight,
     )
 
+
+def parse_perplexity(perplexity_output):
+    """把 dict/float 形式的 perplexity 統一成 dict，方便記錄與平均。"""
+    if isinstance(perplexity_output, dict):
+        return {
+            k: (v.item() if torch.is_tensor(v) else float(v))
+            for k, v in perplexity_output.items()
+        }
+    value = (
+        perplexity_output.item()
+        if torch.is_tensor(perplexity_output)
+        else float(perplexity_output)
+    )
+    return {"latent": value}
+
 ################################################################################
 ################################### Training ###################################
 ################################################################################
@@ -213,6 +251,11 @@ logger.info(f"  Commitment Cost: {commitment_cost}")
 logger.info(f"  Use Max Filters: {use_max_filters}")
 logger.info(f"  Max Filters: {max_filters}")
 logger.info(f"  Small Conv: {small_conv}")
+logger.info(f"  Use Multi-Scale Codebook: {use_multi_scale_codebook}")
+if use_multi_scale_codebook:
+    logger.info(f"    Structure Downsample Factor: {structure_downsample_factor}")
+    logger.info(f"    Structure Embedding Dim: {structure_embedding_dim}")
+    logger.info(f"    Structure Num Embeddings: {structure_num_embeddings}")
 logger.info("-"*80)
 logger.info(f"Loss Configuration:")
 logger.info(f"  Use Sum: {use_sum}")
@@ -263,10 +306,12 @@ for epoch in tqdm(range(epochs), desc="Epochs"):
     train_recon_loss = 0
     train_vq_loss = 0
     train_epoch_perplexity = []
+    train_perplexity_breakdown = {}
     val_loss = 0
     val_recon_loss = 0
     val_vq_loss = 0
     val_epoch_perplexity = []
+    val_perplexity_tracking = {}
 
     # Training Loop
     model.train()
@@ -299,7 +344,10 @@ for epoch in tqdm(range(epochs), desc="Epochs"):
         recon_component = loss_dict["MSE"] + loss_dict["SSIM"] + loss_dict.get("Palette", 0)
         train_recon_loss += recon_component
         train_vq_loss += loss_dict["Commitment Loss"]
-        train_epoch_perplexity.append(perplexity.item())
+        perplexity_dict = parse_perplexity(perplexity)
+        train_epoch_perplexity.append(np.mean(list(perplexity_dict.values())))
+        for key, value in perplexity_dict.items():
+            train_perplexity_breakdown.setdefault(key, []).append(value)
 
     # Validation Loop
     model.eval()
@@ -324,7 +372,10 @@ for epoch in tqdm(range(epochs), desc="Epochs"):
             recon_component = loss_dict["MSE"] + loss_dict["SSIM"] + loss_dict.get("Palette", 0)
             val_recon_loss += recon_component
             val_vq_loss += loss_dict["Commitment Loss"]
-            val_epoch_perplexity.append(perplexity.item())
+            perplexity_dict = parse_perplexity(perplexity)
+            val_epoch_perplexity.append(np.mean(list(perplexity_dict.values())))
+            for key, value in perplexity_dict.items():
+                val_perplexity_tracking.setdefault(key, []).append(value)
 
         # Get reconstruction of our sample
         _, epoch_sample, _, _ = model(sample.to(device))
@@ -339,6 +390,9 @@ for epoch in tqdm(range(epochs), desc="Epochs"):
     all_train_loss.append((train_loss, train_recon_loss, train_vq_loss))
     train_epoch_perplexity = np.mean(train_epoch_perplexity)
     train_perplexity.append(train_epoch_perplexity)
+    train_perplexity_stats = {
+        key: float(np.mean(values)) for key, values in train_perplexity_breakdown.items()
+    }
 
     val_loss = val_loss / len(val_dataloader)
     val_recon_loss = val_recon_loss / len(val_dataloader)
@@ -346,6 +400,9 @@ for epoch in tqdm(range(epochs), desc="Epochs"):
     all_val_loss.append((val_loss, val_recon_loss, val_vq_loss))
     val_epoch_perplexity = np.mean(val_epoch_perplexity)
     val_perplexity.append(val_epoch_perplexity)
+    val_perplexity_stats = {
+        key: float(np.mean(values)) for key, values in val_perplexity_tracking.items()
+    }
 
     # Print Metrics
     logger.info(
@@ -354,10 +411,12 @@ for epoch in tqdm(range(epochs), desc="Epochs"):
         \nTrain Reconstruction Loss = {train_recon_loss}\
         \nTrain Commitment Loss = {train_vq_loss}\
         \nTrain Perplexity = {train_epoch_perplexity}\
+        \nTrain Perplexity Breakdown = {train_perplexity_stats}\
         \nVal Loss = {val_loss}\
         \nVal Reconstruction Loss = {val_recon_loss}\
         \nVal Commitment Loss = {val_vq_loss}\
-        \nVal Perplexity = {val_epoch_perplexity}"
+        \nVal Perplexity = {val_epoch_perplexity}\
+        \nVal Perplexity Breakdown = {val_perplexity_stats}"
     )
 
 ################################################################################
